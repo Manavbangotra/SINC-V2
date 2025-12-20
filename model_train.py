@@ -212,7 +212,7 @@ parser.add_argument("--chunk_size", type=int, default=700000, help="Process data
 parser.add_argument("--batch_size", type=int, default=8, help="Batch size per device")
 parser.add_argument("--gradient_accumulation_steps", type=int, default=32, 
                     help="Number of steps to accumulate gradients before optimizer step")
-parser.add_argument("--epochs", type=int, default=5, 
+parser.add_argument("--epochs", type=int, default=10, 
                     help="Number of training epochs (recommended: 5 for full training schedule)")
 
 # Learning rates (differential learning rates for different components)
@@ -452,338 +452,379 @@ if __name__ == "__main__":
     import torch.nn.functional as F
 
     def collate_fn(batch):
-        # batch is a list of examples
-        input_ids = torch.tensor([ex["input_ids"] for ex in batch], dtype=torch.long)
-        attention_mask = torch.tensor([ex["attention_mask"] for ex in batch], dtype=torch.long)
-        # Load images on-the-fly to avoid storing large tensors in the dataset
+        # Process text inputs
+        texts = [ex["title"] for ex in batch]
+        text_inputs = text_tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=args.max_length,
+            return_tensors="pt"
+        )
+        
+        # Process images
         images = []
         for ex in batch:
-            path = ex.get("image_path")
             try:
-                img = Image.open(path).convert("RGB")
-            except Exception:
-                img = Image.new("RGB", (224, 224), (255, 255, 255))
+                path = ex.get("image_path", "")
+                if os.path.exists(path):
+                    img = Image.open(path).convert("RGB")
+                else:
+                    # If image doesn't exist, use a blank white image
+                    img = Image.new("RGB", (256, 256), (255, 255, 255))
+            except Exception as e:
+                print(f"Error loading image: {e}")
+                img = Image.new("RGB", (256, 256), (255, 255, 255))
             images.append(img)
-        pixel_values = clip_processor(images=images, return_tensors="pt")["pixel_values"]  # (B,C,H,W)
+            
+        # Process images with CLIP processor
+        image_inputs = clip_processor(images=images, return_tensors="pt")
+        
+        # Get labels
         labels = torch.tensor([ex["label"] for ex in batch], dtype=torch.long)
+        
         return {
-            "input_ids": input_ids.to(device),
-            "attention_mask": attention_mask.to(device),
-            "pixel_values": pixel_values.to(device),
-            "labels": labels.to(device),
+            "input_ids": text_inputs["input_ids"].to(device),
+            "attention_mask": text_inputs["attention_mask"].to(device),
+            "pixel_values": image_inputs["pixel_values"].to(device),
+            "labels": labels.to(device)
         }
 
-    # Instantiate model
-    num_labels = len(labels)
-    print(labels)
-    print("Num labels:", num_labels)
-    # Initialize model with frozen encoders by default
-    model = MultimodalClassifier(
-        text_model_name=args.text_model,
-        clip_model=clip_model,
-        num_labels=len(labels),
-        hidden_dim=768,
-        num_transformer_layers=4,  # Using 4 layers as recommended
-        num_heads=8,
-        classifier_hidden=512
-    )
-    
-    # Freeze all parameters by default
-    for param in model.parameters():
-        param.requires_grad = False
-        
-    # Unfreeze classifier and fusion components
-    for module in [model.classifier, model.transformer]:
-        for param in module.parameters():
-            param.requires_grad = True
-            
-    # Unfreeze individual parameters
-    for param in [model.cls_token, model.text_mod_emb, model.img_mod_emb]:
-        if hasattr(param, 'requires_grad'):
-            param.requires_grad = True
-    model.to(device)
+    train_ds, val_ds, test_ds = stratified_split(ds, label_col="label", seed=args.seed)
+    print("Sizes:", len(train_ds), len(val_ds), len(test_ds))
 
-    # -------------------------
-    # 6) Parameter grouping and optimizer setup
-    # -------------------------
-    # Create parameter groups with different learning rates
-    optimizer_groups = [
-        # Classifier head (highest LR)
-        {"params": [p for p in model.classifier.parameters() if p.requires_grad], "lr": args.lr_mlp},
-        
-        # Fusion components (medium LR)
-        {"params": [p for p in model.transformer.parameters() if p.requires_grad], "lr": args.lr_projection},
-        {"params": [model.cls_token, model.text_mod_emb, model.img_mod_emb], "lr": args.lr_projection},
-    ]
-    
-    # Add text encoder parameters if unfrozen
-    if hasattr(model, 'text_encoder') and args.unfreeze_text_layers > 0:
-        text_encoder = model.text_encoder
-        # Only get the last N layers to unfreeze
-        layers_to_unfreeze = text_encoder.encoder.layer[-args.unfreeze_text_layers:]
-        for layer in layers_to_unfreeze:
-            for param in layer.parameters():
-                param.requires_grad = True
-        optimizer_groups.append({
-            "params": [p for p in layers_to_unfreeze.parameters() if p.requires_grad],
-            "lr": args.lr_text,
-            "weight_decay": 0.01
-        })
-    
-    # Add image encoder parameters if unfrozen
-    if hasattr(model, 'clip_model') and args.unfreeze_image_layers > 0:
-        clip_model = model.clip_model
-        # SigLIP typically has a vision model with layers in .encoder.layers
-        if hasattr(clip_model, 'vision_model') and hasattr(clip_model.vision_model, 'encoder'):
-            vision_encoder = clip_model.vision_model.encoder
-            # Calculate how many layers to unfreeze (last N%)
-            total_layers = len(vision_encoder.layers)
-            layers_to_unfreeze = max(1, int(total_layers * (args.unfreeze_image_layers / 100.0)))
-            for layer in vision_encoder.layers[-layers_to_unfreeze:]:
-                for param in layer.parameters():
-                    param.requires_grad = True
-            optimizer_groups.append({
-                "params": [p for p in vision_encoder.layers[-layers_to_unfreeze:].parameters() 
-                          if p.requires_grad],
-                "lr": args.lr_image,
-                "weight_decay": 0.01
-            })
-    
-    # Create optimizer with parameter groups
-    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=0.01)
-    
-    def compute_total_steps_across_chunks(dataset_len, batch_size, chunk_size, epochs):
-        if dataset_len == 0:
-            return 0
-        steps_per_epoch = 0
-        for start, end in iter_chunk_ranges(dataset_len, chunk_size):
-            chunk_len = end - start
-            steps_per_epoch += math.ceil(chunk_len / batch_size)
-        return steps_per_epoch * epochs
-    
-    # Calculate effective batch size and total steps
-    effective_batch_size = args.batch_size * (args.gradient_accumulation_steps if hasattr(args, 'gradient_accumulation_steps') else 1)
-    total_steps = compute_total_steps_across_chunks(
-        len(train_ds), 
-        effective_batch_size,  # Use effective batch size for step calculation
-        args.chunk_size, 
-        args.epochs
-    )
-    
-    # Cosine learning rate scheduler with warmup
-    def get_lr_lambda(current_step: int, num_warmup_steps: int, num_training_steps: int):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-    
-    # Calculate warmup steps (10% of total training steps)
-    num_warmup_steps = int(0.1 * total_steps)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=[
-            lambda step: get_lr_lambda(step, num_warmup_steps, total_steps)
-            for _ in range(len(optimizer.param_groups))
-        ]
-    )
-    
-    # More aggressive warmup (10% of training)
-    num_warmup = int(0.1 * total_steps)
-    
-    # Log training configuration
-    print(f"\nTraining configuration:")
-    print(f"- Batch size: {args.batch_size} (per device)")
-    if hasattr(args, 'gradient_accumulation_steps'):
-        print(f"- Gradient accumulation steps: {args.gradient_accumulation_steps}")
-        print(f"- Effective batch size: {effective_batch_size}")
-    print(f"- Total training steps: {total_steps}")
-    print(f"- Warmup steps: {num_warmup} ({num_warmup/total_steps*100:.1f}%)")
-    print(f"- Learning rates: MLP={args.lr_mlp}, Projection={args.lr_projection}, "
-          f"Text={args.lr_text}, Image={args.lr_image}")
-    
-    # Create scheduler with linear warmup and cosine decay
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, 
-        num_warmup_steps=num_warmup, 
-        num_training_steps=total_steps
+    # ... rest of your code remains the same ...
+# 2) Tokenizers and processors
+# -------------------------
+print("Loading tokenizers / processors...")
+# DeBERTa uses SentencePiece -> force slow tokenizer
+# text_tokenizer = AutoTokenizer.from_pretrained(args.text_model, use_fast=False)
+# text_tokenizer = AutoTokenizer.from_pretrained(args.text_model)
+text_tokenizer = AutoTokenizer.from_pretrained(args.text_model, use_fast=True)
+clip_processor = AutoProcessor.from_pretrained(args.image_model)
+clip_model = SiglipModel.from_pretrained(args.image_model).to(device)  # used for image features
+
+# Optionally load text model separately (we'll load inside the model class)
+text_model_name = args.text_model
+image_model_name = args.image_model
+
+import os
+import aiohttp
+import asyncio
+from aiohttp import ClientTimeout
+from io import BytesIO
+from PIL import Image
+from datasets import load_dataset
+
+SAVE_DIR = "images"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# -------------------------
+# Async fetch function
+# -------------------------
+async def fetch_image(session, url, idx):
+    save_path = os.path.join(SAVE_DIR, f"{idx}.jpg")
+    if os.path.exists(save_path):
+        return  # skip if already downloaded
+
+    try:
+        async with session.get(url, timeout=5) as resp:
+            if resp.status == 200:
+                content = await resp.read()
+                img = Image.open(BytesIO(content)).convert("RGB")
+                img.save(save_path, "JPEG")
+            else:
+                Image.new("RGB", (224, 224), (255, 255, 255)).save(save_path, "JPEG")
+    except:
+        Image.new("RGB", (224, 224), (255, 255, 255)).save(save_path, "JPEG")
+
+# -------------------------
+# Process one batch
+# -------------------------
+async def process_batch(urls, start_idx=0):
+    timeout = ClientTimeout(total=10)
+    connector = aiohttp.TCPConnector(limit=200)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        tasks = []
+        for i, url in enumerate(urls):
+            idx = start_idx + i
+            tasks.append(fetch_image(session, url, idx))
+        await asyncio.gather(*tasks)
+
+# -------------------------
+# Download in 10k chunks
+# -------------------------
+def download_in_chunks(ds, chunk_size=10000):
+    urls = ds["src"]  # column name must match your dataset
+    for start in range(0, len(urls), chunk_size):
+        end = min(start + chunk_size, len(urls))
+        print(f"Downloading {start} → {end} ...")
+        asyncio.run(process_batch(urls[start:end], start_idx=start))
+
+# -------------------------
+# Preprocessing (use local files)
+# -------------------------
+def preprocess_example(example, idx):
+    # Text encoding
+    enc = text_tokenizer(
+        example["title"],
+        truncation=True,
+        padding="max_length",
+        max_length=args.max_length,
+        return_attention_mask=True,
     )
 
-    # -------------------------
-    # 7) Training loop + eval
-    # -------------------------
-    def evaluate_over_dataset(dataset, name="val"):
-        model.eval()
-        all_preds, all_labels = [], []
-        total_loss = 0.0
-        total_batches = 0
-        with torch.no_grad():
-            for start, end in iter_chunk_ranges(len(dataset), args.chunk_size):
-                # download images for this chunk
-                urls_chunk = dataset["src"][start:end]
-                download_range(urls_chunk, offset=start, network_batch=10000)
+    # Store image path only; load/transform in collate_fn to avoid huge Arrow arrays
+    img_path = os.path.join(SAVE_DIR, f"{idx}.jpg")
+    example["input_ids"] = enc["input_ids"]
+    example["attention_mask"] = enc["attention_mask"]
+    example["image_path"] = img_path
+    return example
 
-                # preprocess this chunk (store paths)
-                chunk = dataset.select(range(start, end))
-                chunk = chunk.map(lambda ex, idx: preprocess_example_with_offset(ex, idx, start), with_indices=True)
+# -------------------------
+# Chunked processing helpers (to cap disk usage)
+# -------------------------
 
-                loader = DataLoader(chunk, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-                for batch in loader:
-                    outputs = model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        pixel_values=batch["pixel_values"],
-                        labels=batch["labels"]
-                    )
-                    loss = outputs["loss"]
-                    logits = outputs["logits"]
-                    preds = torch.argmax(logits, dim=-1).cpu().numpy()
-                    all_preds.extend(preds.tolist())
-                    all_labels.extend(batch["labels"].cpu().numpy().tolist())
-                    total_loss += loss.item() if loss is not None else 0.0
-                    total_batches += 1
+def iter_chunk_ranges(n, chunk_size):
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        yield start, end
 
-                # cleanup chunk images
-                cleanup_images_range(start, end)
+def download_range(urls, offset, network_batch=10000):
+    for start in range(0, len(urls), network_batch):
+        end = min(start + network_batch, len(urls))
+        print(f"Downloading {offset + start} → {offset + end} ...")
+        asyncio.run(process_batch(urls[start:end], start_idx=offset + start))
 
-        avg_loss = total_loss / max(1, total_batches)
-        macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
-        micro_acc = accuracy_score(all_labels, all_preds)
-        return {"loss": avg_loss, "macro_f1": macro_f1, "accuracy": micro_acc, "preds": all_preds, "labels": all_labels}
+def preprocess_example_with_offset(example, idx, offset):
+    return preprocess_example(example, idx + offset)
 
-    # Create checkpoint directory if it doesn't exist
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+# Get number of unique labels from the dataset
+num_labels = len(set(ds["label"]))
+print(f"Found {num_labels} unique classes in the dataset")
 
-    # Initialize training state
-    start_epoch = 0
-    best_val_f1 = 0.0
-    total_steps_done = 0
-    last_checkpoint_time = time.time()
-    
-    # Track gradient accumulation
-    accumulation_steps = 0
+# Initialize model
+print("Initializing model...")
+# Initialize model with text finetuning always enabled and image encoder frozen initially
+model = MultimodalClassifier(
+    text_model_name=args.text_model,
+    clip_model=clip_model,
+    num_labels=num_labels,
+    text_finetune=True,  # Always enable text finetuning
+    clip_finetune=False  # Start with frozen image encoder
+).to(device)
+
+# Ensure text encoder is trainable
+for param in model.text_encoder.parameters():
+    param.requires_grad = True
+
+# Set up optimizer
+print("Setting up optimizer...")
+# Use a single learning rate for all parameters, matching V1's approach
+optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
+print("Using single learning rate: 2e-5 for all parameters")
+
+# Set up learning rate scheduler
+total_steps = (len(train_ds) // args.batch_size) * args.epochs
+warmup_steps = int(0.1 * total_steps)  # 10% of training steps for warmup
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=warmup_steps,
+    num_training_steps=total_steps
+)
+
+# Set gradient accumulation to 1 to match V1
+args.gradient_accumulation_steps = 1
+
+print(f"Total training steps: {total_steps}")
+print(f"Warmup steps: {warmup_steps}")
+print(f"Cosine annealing steps: {total_steps - warmup_steps}")
+
+def evaluate_over_dataset(dataset, name="val"):
+    """Evaluate the model on the given dataset."""
+    model.eval()
     total_loss = 0.0
-
-    # Load checkpoint if resuming
-    if args.resume_from:
-        if os.path.isfile(args.resume_from):
-            print(f"Loading checkpoint from {args.resume_from}")
-            checkpoint = torch.load(args.resume_from)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if 'scheduler_state_dict' in checkpoint and hasattr(scheduler, 'load_state_dict'):
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            start_epoch = checkpoint.get('epoch', 0)
-            best_val_f1 = checkpoint.get('best_val_f1', 0.0)
-            total_steps_done = checkpoint.get('total_steps_done', 0)
-            print(f"Resuming training from epoch {start_epoch + 1}, best_val_f1: {best_val_f1:.4f}")
-        else:
-            print(f"Warning: Checkpoint {args.resume_from} not found. Starting from scratch.")
-
-    # Training loop
-    # Progressive unfreezing schedule
-    def update_unfreezing(epoch, model):
-        # Update text encoder layers
-        if hasattr(model, 'text_encoder') and hasattr(model.text_encoder, 'encoder'):
-            text_layers = model.text_encoder.encoder.layer
-            # Unfreeze top N layers
-            for i in range(len(text_layers) - 1, max(-1, len(text_layers) - args.unfreeze_text_layers - 1), -1):
-                for param in text_layers[i].parameters():
-                    param.requires_grad = True
-            
-            print(f"Epoch {epoch+1}: Unfroze top {min(args.unfreeze_text_layers, len(text_layers))} text encoder layers")
-        
-        # Update image encoder layers (assuming ViT architecture for SigLIP)
-        if hasattr(model, 'clip_model') and hasattr(model.clip_model.vision_model, 'encoder'):
-            img_layers = model.clip_model.vision_model.encoder.layers
-            # Unfreeze top N layers
-            for i in range(len(img_layers) - 1, max(-1, len(img_layers) - args.unfreeze_image_layers - 1), -1):
-                for param in img_layers[i].parameters():
-                    param.requires_grad = True
-            
-            print(f"Epoch {epoch+1}: Unfroze top {min(args.unfreeze_image_layers, len(img_layers))} image encoder layers")
+    all_preds = []
+    all_labels = []
     
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-        running_loss = 0.0
-        step_count = 0
-        print(f"\n{'='*50}")
-        print(f"Epoch {epoch+1}/{args.epochs}")
-        print(f"{'='*50}")
+    # Create data loader
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn
+    )
+    
+    with torch.no_grad():
+        for batch in tqdm(loader, desc=f"Evaluating on {name}"):
+            # Forward pass
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                pixel_values=batch["pixel_values"],
+                labels=batch["labels"]
+            )
+            
+            # Get predictions
+            logits = out["logits"]
+            preds = torch.argmax(logits, dim=1)
+            
+            # Store predictions and labels
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(batch["labels"].cpu().numpy())
+            total_loss += out["loss"].item() * len(batch["labels"])
+    
+    # Calculate metrics
+    avg_loss = total_loss / len(dataset)
+    accuracy = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='macro')
+    
+    print(f"\n{name} Evaluation:")
+    print(f"  Loss: {avg_loss:.4f}")
+    print(f"  Accuracy: {accuracy:.4f}")
+    print(f"  Macro-F1: {f1:.4f}")
+    
+    return {
+        "loss": avg_loss,
+        "accuracy": accuracy,
+        "macro_f1": f1,
+        "preds": all_preds,
+        "labels": all_labels
+    }
+
+# Training loop
+# Initialize training state
+best_val_f1 = 0.0
+total_steps_done = 0
+last_checkpoint_time = time.time()
+    
+# Create checkpoint directory if it doesn't exist
+os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+def unfreeze_image_encoder_layers(model, num_layers):
+    """Unfreeze the last 'num_layers' of the image encoder."""
+    if num_layers == 0:
+        # Freeze all layers
+        for param in model.clip_model.parameters():
+            param.requires_grad = False
+    else:
+        # First freeze all layers
+        for param in model.clip_model.parameters():
+            param.requires_grad = False
         
-        # Update unfreezing based on epoch
-        if epoch == 1:  # Start unfreezing in second epoch
-            args.unfreeze_text_layers = 2
-            args.unfreeze_image_layers = 2
-            update_unfreezing(epoch, model)
-        elif epoch == 3:  # Unfreeze more layers in later epochs if needed
-            args.unfreeze_text_layers = 4
-            args.unfreeze_image_layers = 4
-            update_unfreezing(epoch, model)
+        # Unfreeze the last 'num_layers' transformer blocks in the vision encoder
+        vision_encoder = model.clip_model.vision_model.encoder
+        total_layers = len(vision_encoder.layers)
+        
+        # Unfreeze the last 'num_layers' transformer blocks
+        for i in range(max(0, total_layers - num_layers), total_layers):
+            for param in vision_encoder.layers[i].parameters():
+                param.requires_grad = True
+            
+        # Also unfreeze the projection layer
+        if hasattr(model.clip_model, 'visual_projection'):
+            for param in model.clip_model.visual_projection.parameters():
+                param.requires_grad = True
 
-        for start, end in iter_chunk_ranges(len(train_ds), args.chunk_size):
-            # 1) download images for this train chunk
-            urls_chunk = train_ds["src"][start:end]
-            download_range(urls_chunk, offset=start, network_batch=10000)
+for epoch in range(args.epochs):
+    model.train()
+    running_loss = 0.0
+    step_count = 0
+    
+    # Set up progressive unfreezing based on epoch
+    if epoch == 0:
+        # Epoch 1: Freeze image encoder completely
+        unfreeze_image_encoder_layers(model, 0)
+    elif epoch == 1:
+        # Epoch 2: Unfreeze last 1 layer of image encoder
+        unfreeze_image_encoder_layers(model, 1)
+    else:
+        # Epoch 3+: Unfreeze last 2 layers of image encoder
+        unfreeze_image_encoder_layers(model, 2)
+    
+    print(f"\n{'='*50}")
+    print(f"Epoch {epoch+1}/{args.epochs}")
+    print(f"Unfrozen image encoder layers: {model.clip_model.vision_model.encoder.layers[-2:] if epoch > 0 else 'None'}")
+    print(f"{'='*50}")
 
-            # 2) preprocess this chunk (stores paths)
-            train_chunk = train_ds.select(range(start, end))
-            train_chunk = train_chunk.map(lambda ex, idx: preprocess_example_with_offset(ex, idx, start), with_indices=True)
+    # Process dataset in chunks to manage memory
+    for start, end in iter_chunk_ranges(len(train_ds), args.chunk_size):
+        # 1) Download images for this chunk
+        urls_chunk = train_ds["src"][start:end]
+        download_range(urls_chunk, offset=start, network_batch=10000)
 
-            loader = DataLoader(train_chunk, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+        # 2) Preprocess this chunk
+        train_chunk = train_ds.select(range(start, end))
+        train_chunk = train_chunk.map(
+            lambda ex, idx: preprocess_example_with_offset(ex, idx, start), 
+            with_indices=True
+        )
 
-            pbar = tqdm(loader, desc=f"Train {start}-{end}")
-            for step, batch in enumerate(pbar):
+        # 3) Create data loader for this chunk
+        loader = DataLoader(
+            train_chunk, 
+            batch_size=args.batch_size, 
+            shuffle=True, 
+            collate_fn=collate_fn
+        )
+
+        # 4) Training loop for this chunk
+        pbar = tqdm(loader, desc=f"Train {start}-{end}")
+        for step, batch in enumerate(pbar):
+            # Forward pass
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                pixel_values=batch["pixel_values"],
+                labels=batch["labels"]
+            )
+            loss = out["loss"]
+            
+            # Backward pass with gradient accumulation
+            (loss / args.gradient_accumulation_steps).backward()
+            
+            # Only step the optimizer after accumulating enough gradients
+            if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(loader) - 1:
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # Update model parameters
+                optimizer.step()
                 optimizer.zero_grad()
-                out = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    pixel_values=batch["pixel_values"],
-                    labels=batch["labels"]
-                )
-                loss = out["loss"]
-                # Backward pass with gradient accumulation
-                (loss / args.gradient_accumulation_steps).backward()
                 
-                if (step + 1) % args.gradient_accumulation_steps == 0 or step == len(loader) - 1:
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    
-                    # Optimizer step
-                    optimizer.step()
-                    
-                    # Update learning rate
-                    if scheduler is not None:
-                        scheduler.step()
-                        
-                    # Zero gradients
-                    optimizer.zero_grad()
-                
-                running_loss += loss.item()
-                step_count += 1
-                total_steps_done += 1
-                
-                # Update progress bar
-                if step_count % 10 == 0:
-                    pbar.set_postfix({"loss": f"{running_loss / max(1, step_count):.4f}"})
-                
-                # Check if it's time to save a checkpoint
-                current_time = time.time()
-                if current_time - last_checkpoint_time >= args.checkpoint_interval:
-                    checkpoint_path = os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}_step_{total_steps_done}.pt")
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
-                        'best_val_f1': best_val_f1,
-                        'total_steps_done': total_steps_done,
-                        'args': vars(args)
-                    }, checkpoint_path)
-                    print(f"\nSaved checkpoint to {checkpoint_path}")
-                    last_checkpoint_time = current_time
+                # Update learning rate if using a scheduler
+                if scheduler is not None:
+                    scheduler.step()
+            
+            # Update training metrics
+            running_loss += loss.item()
+            step_count += 1
+            total_steps_done += 1
+            
+            # Update progress bar
+            pbar.set_postfix({"loss": f"{running_loss/step_count:.4f}"})
+            
+        # Save checkpoint periodically
+        current_time = time.time()
+        if current_time - last_checkpoint_time >= args.checkpoint_interval:
+            checkpoint_path = os.path.join(
+                args.checkpoint_dir, 
+                f"checkpoint_epoch_{epoch+1}_step_{total_steps_done}.pt"
+            )
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
+                'best_val_f1': best_val_f1,
+                'total_steps_done': total_steps_done,
+                'args': vars(args)
+            }, checkpoint_path)
+            print(f"\nSaved checkpoint to {checkpoint_path}")
+            last_checkpoint_time = current_time
 
-            # 4) cleanup downloaded images for this chunk
-            cleanup_images_range(start, end)
+        # Cleanup downloaded images for this chunk
+        cleanup_images_range(start, end)
 
         # Validate over val set in chunks (after all training chunks are processed)
         val_metrics = evaluate_over_dataset(val_ds, name="val")
