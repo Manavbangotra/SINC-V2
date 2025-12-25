@@ -77,13 +77,6 @@ def is_valid_image(url, min_size=(32, 32), max_size=(10000, 10000), variance_thr
         
         # Additional check: ensure image is not all white or all black
         mean_pixel = np.mean(img_array)
-        if mean_pixel > 250 or mean_pixel < 5:
-            # Check if it's truly uniform (low std dev)
-            std_dev = np.std(img_array)
-            if std_dev < 5:
-                return False
-        
-        return True
         
     except Exception as e:
         # Any error means invalid image
@@ -200,7 +193,7 @@ def filter_valid_images(df, image_url_column='src', use_async=True, batch_size=1
 # -------------------------
 parser = argparse.ArgumentParser()
 # Data arguments
-parser.add_argument("--csv", type=str, default="all_products50.csv", help="Merged CSV path")
+parser.add_argument("--csv", type=str, default="all_products.csv", help="Merged CSV path")
 parser.add_argument("--text_model", type=str, default="microsoft/deberta-v3-small")
 parser.add_argument("--image_model", type=str, default="google/siglip2-base-patch16-256")
 parser.add_argument("--max_length", type=int, default=64)
@@ -245,8 +238,8 @@ if __name__ == "__main__":
 else:
     # Being imported as module - create default args object to avoid errors
     class DefaultArgs:
-        # csv = "all_products.csv"
-        csv = "all_products50.csv"
+        csv = "all_products.csv"
+        # csv = "all_products50.csv"
         text_model = "microsoft/deberta-v3-small"
         image_model = "google/siglip2-base-patch16-256"
         max_length = 64
@@ -692,14 +685,49 @@ def evaluate_over_dataset(dataset, name="val"):
         "labels": all_labels
     }
 
-# Training loop
 # Initialize training state
+start_epoch = 0
 best_val_f1 = 0.0
 total_steps_done = 0
 last_checkpoint_time = time.time()
     
 # Create checkpoint directory if it doesn't exist
 os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+# Load from checkpoint if resuming
+checkpoint = None
+if args.resume_from:
+    try:
+        # First try with weights_only=False to handle NumPy arrays
+        try:
+            # Add numpy._core.multiarray.scalar to safe globals for loading
+            import torch.serialization
+            import numpy
+            torch.serialization.add_safe_globals([numpy._core.multiarray.scalar])
+            
+            # Load with weights_only=False for maximum compatibility
+            checkpoint = torch.load(args.resume_from, map_location='cpu', weights_only=False)
+            print("Successfully loaded checkpoint with weights_only=False")
+        except Exception as e:
+            print(f"Error loading with weights_only=False: {e}")
+            # Try with weights_only=True as a fallback
+            try:
+                checkpoint = torch.load(args.resume_from, map_location='cpu', weights_only=True)
+                print("Successfully loaded checkpoint with weights_only=True")
+            except Exception as e2:
+                print(f"Error loading checkpoint with either method: {e2}")
+                raise
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0) + 1  # Start from next epoch
+        best_val_f1 = checkpoint.get('best_val_f1', 0.0)
+        total_steps_done = checkpoint.get('total_steps_done', 0)
+        print(f"Resuming training from epoch {start_epoch}")
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        print("Starting training from scratch")
 
 def unfreeze_image_encoder_layers(model, num_layers):
     """Unfreeze the last 'num_layers' of the image encoder."""
@@ -726,7 +754,16 @@ def unfreeze_image_encoder_layers(model, num_layers):
             for param in model.clip_model.visual_projection.parameters():
                 param.requires_grad = True
 
-for epoch in range(args.epochs):
+
+# Calculate total epochs to run
+total_epochs = args.epochs
+if args.resume_from and checkpoint is not None:
+    # If resuming, adjust total epochs to complete the requested number of epochs
+    total_epochs = max(args.epochs, start_epoch + (args.epochs - start_epoch))
+
+print(f"Training for {total_epochs} total epochs (starting from epoch {start_epoch})")
+
+for epoch in range(start_epoch, total_epochs):
     model.train()
     running_loss = 0.0
     step_count = 0
