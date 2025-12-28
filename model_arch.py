@@ -3,8 +3,14 @@ import torch.nn as nn
 from transformers import AutoModel, AutoConfig
 
 class MultimodalClassifier(nn.Module):
-    def __init__(self, text_model_name, clip_model, num_labels, text_finetune=True, clip_finetune=False):
+    def __init__(self, text_model_name, clip_model, num_labels, text_finetune=True, clip_finetune=False, class_weights=None):
         super().__init__()
+        # Store class weights
+        if class_weights is not None:
+            self.register_buffer('class_weights', class_weights)
+        else:
+            self.class_weights = None
+            
         # Text encoder
         self.text_encoder = AutoModel.from_pretrained(text_model_name)
         self.text_hidden = self.text_encoder.config.hidden_size
@@ -59,7 +65,7 @@ class MultimodalClassifier(nn.Module):
 
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss(weight=self.class_weights)
             loss = loss_fct(logits, labels)
             
         return {

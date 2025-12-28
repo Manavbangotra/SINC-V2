@@ -16,6 +16,7 @@ import time
 import os
 from datetime import datetime
 from pathlib import Path
+from collections import Counter
 
 from datasets import load_dataset, Dataset, DatasetDict
 from transformers import (
@@ -193,7 +194,7 @@ def filter_valid_images(df, image_url_column='src', use_async=True, batch_size=1
 # -------------------------
 parser = argparse.ArgumentParser()
 # Data arguments
-parser.add_argument("--csv", type=str, default="all_products.csv", help="Merged CSV path")
+parser.add_argument("--csv", type=str, default="all_products50.csv", help="Merged CSV path")
 parser.add_argument("--text_model", type=str, default="microsoft/deberta-v3-small")
 parser.add_argument("--image_model", type=str, default="google/siglip2-base-patch16-256")
 parser.add_argument("--max_length", type=int, default=64)
@@ -238,8 +239,8 @@ if __name__ == "__main__":
 else:
     # Being imported as module - create default args object to avoid errors
     class DefaultArgs:
-        csv = "all_products.csv"
-        # csv = "all_products50.csv"
+        # csv = "all_productsv2.csv"
+        csv = "all_products50.csv"
         text_model = "microsoft/deberta-v3-small"
         image_model = "google/siglip2-base-patch16-256"
         max_length = 64
@@ -596,6 +597,14 @@ def preprocess_example_with_offset(example, idx, offset):
 num_labels = len(set(ds["label"]))
 print(f"Found {num_labels} unique classes in the dataset")
 
+# Calculate class weights for imbalanced dataset
+print("Calculating class weights...")
+label_counts = Counter(ds["label"])
+total_samples = len(ds)
+class_weights = [total_samples / (len(label_counts) * count) for _, count in sorted(label_counts.items())]
+class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+print(f"Class weights: {class_weights.tolist()}")
+
 # Initialize model
 print("Initializing model...")
 # Initialize model with text finetuning always enabled and image encoder frozen initially
@@ -604,18 +613,27 @@ model = MultimodalClassifier(
     clip_model=clip_model,
     num_labels=num_labels,
     text_finetune=True,  # Always enable text finetuning
-    clip_finetune=False  # Start with frozen image encoder
+    clip_finetune=False,  # Start with frozen image encoder
+    class_weights=class_weights  # Pass class weights to model
 ).to(device)
 
 # Ensure text encoder is trainable
 for param in model.text_encoder.parameters():
     param.requires_grad = True
 
-# Set up optimizer
-print("Setting up optimizer...")
-# Use a single learning rate for all parameters, matching V1's approach
-optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
-print("Using single learning rate: 2e-5 for all parameters")
+# Set up optimizer with different learning rates for different components
+print("Setting up optimizer with different learning rates...")
+
+# Create parameter groups with different learning rates
+param_groups = [
+    {'params': model.text_encoder.parameters(), 'lr': args.lr_text},
+    {'params': model.clip_model.parameters(), 'lr': args.lr_image},  # Using clip_model instead of image_encoder
+    {'params': model.classifier.parameters(), 'lr': args.lr_mlp}
+]
+
+optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
+print(f"Using learning rates - Text: {args.lr_text}, Image: {args.lr_image}, "
+      f"MLP: {args.lr_mlp}")
 
 # Set up learning rate scheduler
 total_steps = (len(train_ds) // args.batch_size) * args.epochs
